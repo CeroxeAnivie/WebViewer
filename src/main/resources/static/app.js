@@ -9,6 +9,7 @@ const FLAG_KEYFRAME = 2;
 const MAX_APPEND_QUEUE_BYTES = 10 * 1024 * 1024;
 const MAX_APPEND_QUEUE_SEGMENTS = 8;
 const START_BUFFER_SECONDS = 2.0;
+const STARTUP_MAX_WAIT_MS = 1800;
 const TARGET_LATENCY_SECONDS = 2.5;
 const MAX_LATENCY_SECONDS = 5.0;
 const PANIC_LATENCY_SECONDS = 7.0;
@@ -34,6 +35,7 @@ let height = 0;
 let frames = 0;
 let waitingForKeyframe = true;
 let waitingForStartupBuffer = true;
+let startupBufferStartedAt = 0;
 let lastFpsTime = performance.now();
 let audioContext = null;
 let audioNextTime = 0;
@@ -114,6 +116,7 @@ function resetPlayback() {
     initialized = false;
     waitingForKeyframe = true;
     waitingForStartupBuffer = true;
+    startupBufferStartedAt = performance.now();
     frames = 0;
     if (mediaSource && mediaSource.readyState === 'open') {
         try {
@@ -312,21 +315,21 @@ function trimBuffered() {
     const end = liveRange.end;
     const bufferedAhead = end - current;
     if (waitingForStartupBuffer) {
-        if (end - start < START_BUFFER_SECONDS) {
+        const bufferedInLatestRange = end - start;
+        const waitedMs = performance.now() - startupBufferStartedAt;
+        if (bufferedInLatestRange < START_BUFFER_SECONDS && waitedMs < STARTUP_MAX_WAIT_MS) {
             return;
         }
-        video.currentTime = Math.max(start, end - TARGET_LATENCY_SECONDS);
+        seekToLiveRange(liveRange);
         waitingForStartupBuffer = false;
-        video.playbackRate = 1.0;
         video.play().catch(() => {});
         return;
     }
 
     if (!liveRange.containsCurrent || bufferedAhead > PANIC_LATENCY_SECONDS) {
-        video.currentTime = Math.max(start, end - TARGET_LATENCY_SECONDS);
-        video.playbackRate = 1.0;
+        seekToLiveRange(liveRange);
     } else if (bufferedAhead > MAX_LATENCY_SECONDS) {
-        video.currentTime = Math.max(start, end - TARGET_LATENCY_SECONDS);
+        seekToLiveRange(liveRange);
         video.playbackRate = 1.03;
     } else if (bufferedAhead > TARGET_LATENCY_SECONDS + 1.0) {
         video.playbackRate = 1.08;
@@ -356,18 +359,30 @@ function trimBuffered() {
     }
 }
 
+function seekToLiveRange(liveRange) {
+    video.currentTime = Math.max(liveRange.start, liveRange.end - TARGET_LATENCY_SECONDS);
+    video.playbackRate = 1.0;
+}
+
 function updateStats(w, h, frameCount) {
     frames += Math.max(1, frameCount);
     const now = performance.now();
     if (now - lastFpsTime >= 1000) {
         const liveRange = latestBufferedRange();
         const liveBuffer = liveRange
-                ? Math.max(0, liveRange.end - video.currentTime).toFixed(1)
+                ? displayBufferSeconds(liveRange).toFixed(1)
                 : '0.0';
         setStatus(`${w}x${h} | ${frames} FPS | buffer ${liveBuffer}s | video/MSE`);
         frames = 0;
         lastFpsTime = now;
     }
+}
+
+function displayBufferSeconds(liveRange) {
+    if (liveRange.containsCurrent) {
+        return Math.max(0, liveRange.end - video.currentTime);
+    }
+    return Math.max(0, liveRange.end - liveRange.start);
 }
 
 function latestBufferedRange() {

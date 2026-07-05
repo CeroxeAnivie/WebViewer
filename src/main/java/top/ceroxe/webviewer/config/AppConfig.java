@@ -16,10 +16,12 @@ public record AppConfig(
         int adapterIndex,
         String password
 ) {
-    private static final int MIN_AUTO_VIDEO_BITRATE = 3_000_000;
-    private static final int MAX_AUTO_VIDEO_BITRATE = 200_000_000;
+    private static final int MIN_AUTO_VIDEO_BITRATE = 4_000_000;
+    private static final int MAX_AUTO_VIDEO_BITRATE = 80_000_000;
     private static final int BITRATE_STEP = 1_000_000;
-    private static final double LIVE_BITS_PER_PIXEL_FRAME = 0.065;
+    private static final int FULL_BITRATE_FPS = 60;
+    private static final double HIGH_FPS_EXTRA_WEIGHT = 0.35;
+    private static final double LIVE_BITS_PER_PIXEL_FRAME = 0.038;
 
     public AppConfig {
         requirePort(httpPort, "httpPort");
@@ -72,13 +74,21 @@ public record AppConfig(
     }
 
     public static int recommendedVideoBitrate(int width, int height, int fps) {
+        double weightedFps = weightedFpsForLiveBitrate(Math.max(1, fps));
         double rawBitrate = (double) Math.max(1, width)
                 * Math.max(1, height)
-                * Math.max(1, fps)
+                * weightedFps
                 * LIVE_BITS_PER_PIXEL_FRAME;
         long rounded = (long) Math.ceil(rawBitrate / BITRATE_STEP) * BITRATE_STEP;
         long clamped = Math.max(MIN_AUTO_VIDEO_BITRATE, Math.min(MAX_AUTO_VIDEO_BITRATE, rounded));
         return Math.toIntExact(clamped);
+    }
+
+    private static double weightedFpsForLiveBitrate(int fps) {
+        if (fps <= FULL_BITRATE_FPS) {
+            return fps;
+        }
+        return FULL_BITRATE_FPS + (fps - FULL_BITRATE_FPS) * HIGH_FPS_EXTRA_WEIGHT;
     }
 
     public InetSocketAddress httpAddress() {

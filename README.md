@@ -62,7 +62,7 @@ java -jar target\WebViewer-2.0.1.jar
 
 ```cmd
 chcp 65001 >nul
-java -jar target\WebViewer-2.0.1.jar --http-port=8080 --width=2560 --height=1600 --fps=120 --bitrate=30000000 --password=1122
+java -jar target\WebViewer-2.0.1.jar --http-port=8080 --width=2560 --height=1600 --fps=120 --password=1122
 ```
 
 启动后访问：
@@ -88,7 +88,7 @@ http://localhost:8080
 | `--gpu` | `-1` | 采集 GPU 索引，`-1` 表示自动 |
 | `--password` | 无 | 访问密码，必填 |
 
-不传 `--bitrate` 时，程序会根据分辨率和帧率自动推荐高质量直播码率。
+不传 `--bitrate` 时，程序会根据分辨率和帧率自动推荐直播码率。推荐值按网页直播的持续吞吐模型计算，高帧率不会简单线性翻倍码率；如果只在内网或专线环境使用，可以手动提高 `--bitrate`。
 
 ## 播放模型
 
