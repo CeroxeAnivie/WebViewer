@@ -27,6 +27,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -40,9 +41,15 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class UnifiedWebServer implements MediaChunkSink {
     private static final String RESOURCE_ROOT = "/static";
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    private static final int MAX_CLIENT_QUEUE = 90;
+    private static final int MAX_CLIENT_QUEUE = 24;
+    private static final int MAX_CLIENT_CONTROL_PAYLOAD = 64 * 1024;
+    private static final int MAX_SOCKET_SEND_BUFFER_BYTES = 512 * 1024;
+    private static final int MIN_CLIENT_QUEUE_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_CLIENT_QUEUE_BYTES = 16 * 1024 * 1024;
+    private static final double CLIENT_QUEUE_SECONDS = 2.0;
     private static final long STATS_INTERVAL_NANOS = 5_000_000_000L;
     private static final int MAX_FRAMES_PER_SOCKET_FLUSH = 12;
+    private static final int HEARTBEAT_SECONDS = 15;
 
     private static final Map<String, String> MIME_TYPES = Map.of(
             "html", "text/html; charset=utf-8",
@@ -59,6 +66,7 @@ public final class UnifiedWebServer implements MediaChunkSink {
     private final AtomicLong lastStatsNanos = new AtomicLong(System.nanoTime());
     private final AtomicLong lastStatsPublished = new AtomicLong();
     private final CmafMuxer muxer = new CmafMuxer();
+    private final int maxClientQueuedBytes;
 
     private volatile byte[] latestInitSegment;
     private volatile byte[] latestKeySegment;
@@ -67,6 +75,7 @@ public final class UnifiedWebServer implements MediaChunkSink {
 
     public UnifiedWebServer(AppConfig config) {
         this.config = Objects.requireNonNull(config, "config");
+        this.maxClientQueuedBytes = maxClientQueuedBytes(config.videoBitrate());
     }
 
     public void start() throws IOException {
@@ -144,6 +153,8 @@ public final class UnifiedWebServer implements MediaChunkSink {
             try {
                 Socket socket = serverSocket.accept();
                 socket.setTcpNoDelay(true);
+                socket.setKeepAlive(true);
+                socket.setSendBufferSize(MAX_SOCKET_SEND_BUFFER_BYTES);
                 Thread.startVirtualThread(() -> handle(socket));
             } catch (IOException e) {
                 if (running.get()) {
@@ -204,7 +215,7 @@ public final class UnifiedWebServer implements MediaChunkSink {
         output.write(response.getBytes(StandardCharsets.ISO_8859_1));
         output.flush();
 
-        Client client = new Client(socket, output);
+        Client client = new Client(socket, output, maxClientQueuedBytes);
         clients.add(client);
         client.start();
         client.enqueueText("{\"type\":\"hello\",\"format\":\"" + CmafMuxer.FORMAT + "\",\"version\":2,"
@@ -244,6 +255,10 @@ public final class UnifiedWebServer implements MediaChunkSink {
                     for (int i = 0; i < 8; i++) {
                         length = (length << 8) | input.read();
                     }
+                }
+                if (length < 0 || length > MAX_CLIENT_CONTROL_PAYLOAD) {
+                    client.close();
+                    break;
                 }
                 byte[] mask = masked ? input.readNBytes(4) : new byte[0];
                 byte[] payload = input.readNBytes(Math.toIntExact(length));
@@ -285,14 +300,18 @@ public final class UnifiedWebServer implements MediaChunkSink {
             return;
         }
         int maxQueue = 0;
+        long maxQueueBytes = 0;
         long clientDropped = 0;
         for (Client client : clients) {
             maxQueue = Math.max(maxQueue, client.queueSize());
+            maxQueueBytes = Math.max(maxQueueBytes, client.queuedBytes());
             clientDropped += client.droppedFrames();
         }
         AppLog.info("Stream", "publishFps=" + fps
                 + ", viewers=" + viewers
                 + ", maxClientQueue=" + maxQueue + "/" + MAX_CLIENT_QUEUE
+                + ", maxClientQueueBytes=" + (maxQueueBytes / 1024 / 1024) + "MiB/"
+                + (maxClientQueuedBytes / 1024 / 1024) + "MiB"
                 + ", droppedFrames=" + droppedFrames.get()
                 + ", clientDroppedFrames=" + clientDropped);
     }
@@ -401,6 +420,11 @@ public final class UnifiedWebServer implements MediaChunkSink {
         return MIME_TYPES.getOrDefault(path.substring(dot + 1), "application/octet-stream");
     }
 
+    private static int maxClientQueuedBytes(int videoBitrate) {
+        long bytes = Math.round(Math.max(1, videoBitrate) / 8.0 * CLIENT_QUEUE_SECONDS);
+        return (int) Math.max(MIN_CLIENT_QUEUE_BYTES, Math.min(MAX_CLIENT_QUEUE_BYTES, bytes));
+    }
+
     private static void closeQuietly(AutoCloseable closeable) {
         if (closeable != null) {
             try {
@@ -439,14 +463,18 @@ public final class UnifiedWebServer implements MediaChunkSink {
     private static final class Client {
         private final Socket socket;
         private final BufferedOutputStream output;
+        private final int maxQueuedBytes;
         private final LinkedBlockingDeque<OutboundFrame> queue = new LinkedBlockingDeque<>(MAX_CLIENT_QUEUE);
         private final AtomicBoolean open = new AtomicBoolean(true);
         private final AtomicLong droppedFrames = new AtomicLong();
+        private final AtomicLong queuedBytes = new AtomicLong();
+        private volatile boolean waitingForKeyframe;
         private Thread writerThread;
 
-        private Client(Socket socket, BufferedOutputStream output) {
+        private Client(Socket socket, BufferedOutputStream output, int maxQueuedBytes) {
             this.socket = socket;
             this.output = output;
+            this.maxQueuedBytes = maxQueuedBytes;
         }
 
         boolean open() {
@@ -477,17 +505,47 @@ public final class UnifiedWebServer implements MediaChunkSink {
             if (!open.get()) {
                 return -1;
             }
+            if (waitingForKeyframe && opcode == 0x2 && !keyframe) {
+                droppedFrames.incrementAndGet();
+                return 1;
+            }
             long dropped = 0;
             if (keyframe) {
                 dropped = removeDroppableFrames();
+                waitingForKeyframe = false;
             }
             OutboundFrame frame = new OutboundFrame(opcode, payload, droppable);
-            while (!queue.offerLast(frame)) {
-                if (!removeOneQueuedFrame()) {
-                    break;
-                }
+            while ((queue.size() >= MAX_CLIENT_QUEUE || queuedBytes.get() + payload.length > maxQueuedBytes)
+                    && removeOneQueuedFrame()) {
                 dropped++;
             }
+
+            if (dropped > 0 && opcode == 0x2 && !keyframe) {
+                waitingForKeyframe = true;
+                dropped++;
+                droppedFrames.addAndGet(dropped);
+                return dropped;
+            }
+
+            if (queue.size() >= MAX_CLIENT_QUEUE || queuedBytes.get() + payload.length > maxQueuedBytes) {
+                if (droppable) {
+                    waitingForKeyframe = opcode == 0x2 && !keyframe;
+                    dropped++;
+                    droppedFrames.addAndGet(dropped);
+                    return dropped;
+                }
+                dropped += removeDroppableFrames();
+            }
+            if (!queue.offerLast(frame)) {
+                if (droppable) {
+                    waitingForKeyframe = opcode == 0x2 && !keyframe;
+                    dropped++;
+                    droppedFrames.addAndGet(dropped);
+                    return dropped;
+                }
+                return -1;
+            }
+            queuedBytes.addAndGet(payload.length);
             if (dropped > 0) {
                 droppedFrames.addAndGet(dropped);
             }
@@ -498,6 +556,7 @@ public final class UnifiedWebServer implements MediaChunkSink {
             long dropped = 0;
             for (OutboundFrame frame : queue) {
                 if (frame.droppable() && queue.remove(frame)) {
+                    queuedBytes.addAndGet(-frame.payload().length);
                     dropped++;
                 }
             }
@@ -507,14 +566,19 @@ public final class UnifiedWebServer implements MediaChunkSink {
         private boolean removeOneQueuedFrame() {
             for (OutboundFrame frame : queue) {
                 if (frame.droppable() && queue.remove(frame)) {
+                    queuedBytes.addAndGet(-frame.payload().length);
                     return true;
                 }
             }
-            return queue.pollFirst() != null;
+            return false;
         }
 
         int queueSize() {
             return queue.size();
+        }
+
+        long queuedBytes() {
+            return queuedBytes.get();
         }
 
         long droppedFrames() {
@@ -524,10 +588,18 @@ public final class UnifiedWebServer implements MediaChunkSink {
         private void writeLoop() {
             try {
                 while (open.get() || !queue.isEmpty()) {
-                    OutboundFrame frame = open.get() ? queue.takeFirst() : queue.pollFirst();
+                    OutboundFrame frame = open.get()
+                            ? queue.pollFirst(HEARTBEAT_SECONDS, TimeUnit.SECONDS)
+                            : queue.pollFirst();
                     if (frame == null) {
+                        if (open.get()) {
+                            writeFrame(0x9, new byte[0]);
+                            output.flush();
+                            continue;
+                        }
                         break;
                     }
+                    queuedBytes.addAndGet(-frame.payload().length);
                     writeFrame(frame.opcode(), frame.payload());
                     int drained = 1;
                     while (drained < MAX_FRAMES_PER_SOCKET_FLUSH) {
@@ -535,6 +607,7 @@ public final class UnifiedWebServer implements MediaChunkSink {
                         if (next == null) {
                             break;
                         }
+                        queuedBytes.addAndGet(-next.payload().length);
                         writeFrame(next.opcode(), next.payload());
                         drained++;
                     }
@@ -546,6 +619,7 @@ public final class UnifiedWebServer implements MediaChunkSink {
                 open.set(false);
             } finally {
                 queue.clear();
+                queuedBytes.set(0);
                 closeQuietly(socket);
             }
         }
@@ -571,6 +645,7 @@ public final class UnifiedWebServer implements MediaChunkSink {
         void close() {
             if (open.compareAndSet(true, false)) {
                 queue.clear();
+                queuedBytes.set(0);
                 if (writerThread != null) {
                     writerThread.interrupt();
                 }
@@ -581,7 +656,10 @@ public final class UnifiedWebServer implements MediaChunkSink {
         void closeGracefully(byte[] closePayload) {
             if (open.compareAndSet(true, false)) {
                 queue.clear();
-                queue.offerLast(new OutboundFrame(0x8, closePayload, false));
+                queuedBytes.set(0);
+                OutboundFrame closeFrame = new OutboundFrame(0x8, closePayload, false);
+                queue.offerLast(closeFrame);
+                queuedBytes.addAndGet(closePayload.length);
                 if (writerThread != null) {
                     try {
                         writerThread.join(300);

@@ -5,11 +5,14 @@ const PCM_MAGIC = 0x50434d41;
 const HEADER_BYTES = 16;
 const AUDIO_HEADER_BYTES = 24;
 const FLAG_INIT = 1;
-const MAX_APPEND_QUEUE_BYTES = 32 * 1024 * 1024;
-const START_BUFFER_SECONDS = 4.0;
-const TARGET_LATENCY_SECONDS = 5.0;
-const MAX_LATENCY_SECONDS = 14.0;
-const BACK_BUFFER_SECONDS = 18.0;
+const FLAG_KEYFRAME = 2;
+const MAX_APPEND_QUEUE_BYTES = 10 * 1024 * 1024;
+const MAX_APPEND_QUEUE_SEGMENTS = 8;
+const START_BUFFER_SECONDS = 2.0;
+const TARGET_LATENCY_SECONDS = 2.5;
+const MAX_LATENCY_SECONDS = 5.0;
+const PANIC_LATENCY_SECONDS = 7.0;
+const BACK_BUFFER_SECONDS = 8.0;
 const RECONNECT_DELAY_MS = 800;
 
 const video = document.getElementById('screen');
@@ -216,10 +219,14 @@ function receiveVideoPacket(buffer, view) {
         initializeSourceBuffer(payload);
         return;
     }
-    if (!initialized || waitingForKeyframe) {
+    const keyframe = (flags & FLAG_KEYFRAME) !== 0;
+    if (!initialized || (waitingForKeyframe && !keyframe)) {
         return;
     }
-    enqueueSegment(payload, false);
+    if (keyframe) {
+        waitingForKeyframe = false;
+    }
+    enqueueSegment(payload, keyframe);
     updateStats(width, height, sampleCountFromFragment(payload));
 }
 
@@ -261,14 +268,16 @@ function createSourceBuffer(mime, init) {
 }
 
 function enqueueSegment(segment, keyframe) {
-    if (appendQueueBytes + segment.length > MAX_APPEND_QUEUE_BYTES) {
+    if (appendQueueBytes + segment.length > MAX_APPEND_QUEUE_BYTES
+            || appendQueue.length >= MAX_APPEND_QUEUE_SEGMENTS) {
         appendQueue = [];
         appendQueueBytes = 0;
-        waitingForKeyframe = !keyframe;
         if (!keyframe) {
+            waitingForKeyframe = true;
             setStatus('\u7f51\u7edc\u7f13\u51b2\u8fc7\u8f7d\uff0c\u7b49\u5f85\u5173\u952e\u5e27\u6062\u590d');
             return;
         }
+        waitingForKeyframe = false;
     }
     appendQueue.push({ data: segment, keyframe });
     appendQueueBytes += segment.length;
@@ -295,8 +304,12 @@ function trimBuffered() {
         return;
     }
     const current = video.currentTime;
-    const start = video.buffered.start(0);
-    const end = video.buffered.end(video.buffered.length - 1);
+    const liveRange = latestBufferedRange();
+    if (!liveRange) {
+        return;
+    }
+    const start = liveRange.start;
+    const end = liveRange.end;
     const bufferedAhead = end - current;
     if (waitingForStartupBuffer) {
         if (end - start < START_BUFFER_SECONDS) {
@@ -309,15 +322,30 @@ function trimBuffered() {
         return;
     }
 
-    if (current < start || current > end || bufferedAhead > MAX_LATENCY_SECONDS) {
+    if (!liveRange.containsCurrent || bufferedAhead > PANIC_LATENCY_SECONDS) {
         video.currentTime = Math.max(start, end - TARGET_LATENCY_SECONDS);
         video.playbackRate = 1.0;
-    } else if (bufferedAhead > TARGET_LATENCY_SECONDS + 1.25) {
-        video.playbackRate = 1.02;
-    } else if (bufferedAhead < TARGET_LATENCY_SECONDS - 1.25) {
-        video.playbackRate = 0.98;
+    } else if (bufferedAhead > MAX_LATENCY_SECONDS) {
+        video.currentTime = Math.max(start, end - TARGET_LATENCY_SECONDS);
+        video.playbackRate = 1.03;
+    } else if (bufferedAhead > TARGET_LATENCY_SECONDS + 1.0) {
+        video.playbackRate = 1.08;
+    } else if (bufferedAhead > TARGET_LATENCY_SECONDS + 0.35) {
+        video.playbackRate = 1.03;
+    } else if (bufferedAhead < TARGET_LATENCY_SECONDS - 1.0) {
+        video.playbackRate = 0.97;
     } else {
         video.playbackRate = 1.0;
+    }
+    if (video.paused) {
+        video.play().catch(() => {});
+    }
+    if (video.buffered.length > 1) {
+        try {
+            sourceBuffer.remove(video.buffered.start(0), start);
+        } catch {
+            // Removing obsolete ranges is best-effort; playback can continue.
+        }
     }
     if (current - start > BACK_BUFFER_SECONDS) {
         try {
@@ -332,13 +360,29 @@ function updateStats(w, h, frameCount) {
     frames += Math.max(1, frameCount);
     const now = performance.now();
     if (now - lastFpsTime >= 1000) {
-        const liveBuffer = video.buffered.length
-                ? Math.max(0, video.buffered.end(video.buffered.length - 1) - video.currentTime).toFixed(1)
+        const liveRange = latestBufferedRange();
+        const liveBuffer = liveRange
+                ? Math.max(0, liveRange.end - video.currentTime).toFixed(1)
                 : '0.0';
         setStatus(`${w}x${h} | ${frames} FPS | buffer ${liveBuffer}s | video/MSE`);
         frames = 0;
         lastFpsTime = now;
     }
+}
+
+function latestBufferedRange() {
+    if (video.buffered.length === 0) {
+        return null;
+    }
+    const last = video.buffered.length - 1;
+    const start = video.buffered.start(last);
+    const end = video.buffered.end(last);
+    const current = video.currentTime;
+    return {
+        start,
+        end,
+        containsCurrent: current >= start - 0.05 && current <= end + 0.05
+    };
 }
 
 function fitVideoToViewport() {
