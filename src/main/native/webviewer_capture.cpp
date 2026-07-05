@@ -868,24 +868,24 @@ public:
             return false;
         }
 
-        GUID selected_preset = fps_ >= 120 ? NV_ENC_PRESET_P1_GUID : NV_ENC_PRESET_P5_GUID;
-        NV_ENC_TUNING_INFO tuning = fps_ >= 120 ? NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY : NV_ENC_TUNING_INFO_LOW_LATENCY;
+        GUID selected_preset = NV_ENC_PRESET_P2_GUID;
+        NV_ENC_TUNING_INFO tuning = NV_ENC_TUNING_INFO_HIGH_QUALITY;
         if (!load_preset_config(env, selected_preset, tuning)) {
             report_status(env, "NVENC preset config unavailable, using minimal manual config");
             std::memset(&config_, 0, sizeof(config_));
             config_.version = NV_ENC_CONFIG_VER;
         }
         config_.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
-        uint32_t idr_period = fps_ >= 2 ? fps_ / 2 : 1;
+        uint32_t idr_period = fps_ >= 1 ? fps_ : 1;
         config_.gopLength = idr_period;
         config_.frameIntervalP = 1;
         config_.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
         config_.rcParams.averageBitRate = bitrate_;
         config_.rcParams.maxBitRate = bitrate_;
-        config_.rcParams.vbvBufferSize = bitrate_;
-        config_.rcParams.vbvInitialDelay = bitrate_ / 2;
-        config_.rcParams.enableAQ = 0;
-        config_.rcParams.enableTemporalAQ = 0;
+        config_.rcParams.vbvBufferSize = bitrate_ * 2;
+        config_.rcParams.vbvInitialDelay = bitrate_;
+        config_.rcParams.enableAQ = 1;
+        config_.rcParams.enableTemporalAQ = 1;
         config_.rcParams.enableLookahead = 0;
         config_.rcParams.lookaheadDepth = 0;
         config_.rcParams.zeroReorderDelay = 1;
@@ -1135,11 +1135,8 @@ private:
     bool load_preset_config(JNIEnv *env, GUID &selected_preset, NV_ENC_TUNING_INFO tuning) {
         const GUID candidates[] = {
                 selected_preset,
-                NV_ENC_PRESET_P1_GUID,
                 NV_ENC_PRESET_P2_GUID,
-                NV_ENC_PRESET_P3_GUID,
-                NV_ENC_PRESET_P5_GUID,
-                NV_ENC_PRESET_P4_GUID
+                NV_ENC_PRESET_P1_GUID
         };
         for (const GUID &preset_guid : candidates) {
             NV_ENC_PRESET_CONFIG preset{};
@@ -1520,7 +1517,7 @@ static FrameSendResult send_wgc_frame(JNIEnv *env, WgcContext &wgc, NvencTexture
     wgc.last_reported_frame = captured_frames;
 
     if (nvenc && target_width == wgc.source_width && target_height == wgc.source_height) {
-        uint64_t idr_period = static_cast<uint64_t>(fps > 1 ? fps / 2 : 1);
+        uint64_t idr_period = static_cast<uint64_t>(fps > 0 ? fps : 1);
         result.ok = nvenc->encode(env, wgc.latest.get(),
                                   frame_index % idr_period == 0,
                                   &wgc.texture_mutex);

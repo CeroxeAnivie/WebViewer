@@ -11,7 +11,7 @@ public final class CmafMuxer {
     public static final int FLAG_INIT = 1;
     public static final int FLAG_KEYFRAME = 2;
     private static final int TIMESCALE = 1_000_000;
-    private static final int SEGMENT_MICROS = 100_000;
+    private static final int SEGMENT_MICROS = 1_000_000;
 
     private final List<Sample> pendingSamples = new ArrayList<>();
     private byte[] initSegment;

@@ -5,13 +5,12 @@ const PCM_MAGIC = 0x50434d41;
 const HEADER_BYTES = 16;
 const AUDIO_HEADER_BYTES = 24;
 const FLAG_INIT = 1;
-const MAX_APPEND_QUEUE_BYTES = 10 * 1024 * 1024;
-const MAX_APPEND_BATCH_BYTES = 2 * 1024 * 1024;
-const MAX_APPEND_BATCH_SEGMENTS = 10;
-const START_BUFFER_SECONDS = 2.5;
-const TARGET_LATENCY_SECONDS = 3.0;
-const MAX_LATENCY_SECONDS = 8.0;
-const BACK_BUFFER_SECONDS = 12.0;
+const MAX_APPEND_QUEUE_BYTES = 32 * 1024 * 1024;
+const START_BUFFER_SECONDS = 4.0;
+const TARGET_LATENCY_SECONDS = 5.0;
+const MAX_LATENCY_SECONDS = 14.0;
+const BACK_BUFFER_SECONDS = 18.0;
+const RECONNECT_DELAY_MS = 800;
 
 const video = document.getElementById('screen');
 const viewport = document.querySelector('.viewport');
@@ -35,6 +34,9 @@ let waitingForStartupBuffer = true;
 let lastFpsTime = performance.now();
 let audioContext = null;
 let audioNextTime = 0;
+let resizeObserver = null;
+let reconnectTimer = 0;
+let userDisconnecting = false;
 
 function setStatus(text, error = false) {
     statusLine.textContent = text;
@@ -56,6 +58,7 @@ function connect() {
     disconnect();
     resetPlayback();
     ensureAudioContext();
+    userDisconnecting = false;
     connectButton.disabled = true;
     setStatus('\u6b63\u5728\u8fde\u63a5');
 
@@ -75,10 +78,30 @@ function connect() {
 }
 
 function disconnect() {
+    userDisconnecting = true;
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = 0;
+    }
     if (socket) {
         socket.close(1000, 'Reconnect');
         socket = null;
     }
+}
+
+function reconnectAfterPlaybackFailure(reason) {
+    if (userDisconnecting || reconnectTimer) {
+        return;
+    }
+    setStatus(`\u64ad\u653e\u7ba1\u7ebf\u6062\u590d\u4e2d: ${reason}`, true);
+    reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = 0;
+        if (socket) {
+            socket.close(1011, 'Media pipeline reset');
+            socket = null;
+        }
+        connect();
+    }, RECONNECT_DELAY_MS);
 }
 
 function resetPlayback() {
@@ -105,6 +128,7 @@ function resetPlayback() {
     video.removeAttribute('src');
     video.src = objectUrl;
     video.pause();
+    fitVideoToViewport();
 }
 
 function receivePacket(buffer) {
@@ -207,6 +231,7 @@ function initializeSourceBuffer(initSegment) {
     const dimensions = dimensionsFromInitSegment(initSegment);
     width = dimensions.width || width;
     height = dimensions.height || height;
+    fitVideoToViewport();
     const mime = `video/mp4; codecs="${codec}"`;
     if (!MediaSource.isTypeSupported(mime)) {
         setStatus(`\u6d4f\u89c8\u5668\u4e0d\u652f\u6301: ${mime}`, true);
@@ -224,7 +249,9 @@ function initializeSourceBuffer(initSegment) {
 
 function createSourceBuffer(mime, init) {
     sourceBuffer = mediaSource.addSourceBuffer(mime);
-    sourceBuffer.mode = 'sequence';
+    sourceBuffer.mode = 'segments';
+    sourceBuffer.addEventListener('error', () => reconnectAfterPlaybackFailure('SourceBuffer error'));
+    sourceBuffer.addEventListener('abort', () => reconnectAfterPlaybackFailure('SourceBuffer abort'));
     sourceBuffer.addEventListener('updateend', () => {
         trimBuffered();
         pumpAppendQueue();
@@ -253,21 +280,13 @@ function pumpAppendQueue() {
         return;
     }
     try {
-        const batch = [];
-        let batchBytes = 0;
-        while (appendQueue.length > 0 && batch.length < MAX_APPEND_BATCH_SEGMENTS) {
-            const next = appendQueue[0];
-            if (batch.length > 0 && batchBytes + next.data.length > MAX_APPEND_BATCH_BYTES) {
-                break;
-            }
-            appendQueue.shift();
-            appendQueueBytes -= next.data.length;
-            batch.push(next.data);
-            batchBytes += next.data.length;
-        }
-        sourceBuffer.appendBuffer(batch.length === 1 ? batch[0] : concat(...batch));
+        const next = appendQueue.shift();
+        appendQueueBytes -= next.data.length;
+        sourceBuffer.appendBuffer(next.data);
     } catch (error) {
-        setStatus(`\u89c6\u9891\u7f13\u51b2\u5199\u5165\u5931\u8d25: ${error.message}`, true);
+        appendQueue = [];
+        appendQueueBytes = 0;
+        reconnectAfterPlaybackFailure(error.message || 'appendBuffer failed');
     }
 }
 
@@ -322,6 +341,24 @@ function updateStats(w, h, frameCount) {
     }
 }
 
+function fitVideoToViewport() {
+    const viewportWidth = Math.max(0, viewport.clientWidth);
+    const viewportHeight = Math.max(0, viewport.clientHeight);
+    const sourceWidth = width || video.videoWidth || 16;
+    const sourceHeight = height || video.videoHeight || 9;
+    if (viewportWidth <= 0 || viewportHeight <= 0 || sourceWidth <= 0 || sourceHeight <= 0) {
+        return;
+    }
+
+    // The viewer is a pure contain transform: preserve source aspect ratio,
+    // choose the largest rectangle inside the available viewport, and never crop.
+    const scale = Math.min(viewportWidth / sourceWidth, viewportHeight / sourceHeight);
+    const fittedWidth = Math.max(1, Math.floor(sourceWidth * scale));
+    const fittedHeight = Math.max(1, Math.floor(sourceHeight * scale));
+    video.style.setProperty('--fit-width', `${fittedWidth}px`);
+    video.style.setProperty('--fit-height', `${fittedHeight}px`);
+}
+
 async function toggleFullscreen() {
     try {
         if (document.fullscreenElement) {
@@ -342,6 +379,7 @@ function updateFullscreenButton() {
     fullscreenButton.textContent = document.fullscreenElement ? '\u9000' : '\u5168';
     fullscreenButton.title = document.fullscreenElement ? '\u9000\u51fa\u5168\u5c4f' : '\u5168\u5c4f';
     fullscreenButton.setAttribute('aria-label', fullscreenButton.title);
+    fitVideoToViewport();
 }
 
 function codecFromInitSegment(segment) {
@@ -392,17 +430,6 @@ function findBox(data, type, start, end) {
     return -1;
 }
 
-function concat(...arrays) {
-    const length = arrays.reduce((sum, array) => sum + array.length, 0);
-    const out = new Uint8Array(length);
-    let offset = 0;
-    for (const array of arrays) {
-        out.set(array, offset);
-        offset += array.length;
-    }
-    return out;
-}
-
 function readUint32(data, offset) {
     return ((data[offset] << 24) >>> 0) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3];
 }
@@ -414,8 +441,16 @@ function hex2(value) {
 connectButton.addEventListener('click', connect);
 fullscreenButton.addEventListener('click', toggleFullscreen);
 document.addEventListener('fullscreenchange', updateFullscreenButton);
+window.addEventListener('resize', fitVideoToViewport);
+window.addEventListener('orientationchange', () => setTimeout(fitVideoToViewport, 250));
+video.addEventListener('loadedmetadata', fitVideoToViewport);
+if ('ResizeObserver' in window) {
+    resizeObserver = new ResizeObserver(fitVideoToViewport);
+    resizeObserver.observe(viewport);
+}
 passwordInput.addEventListener('keydown', event => {
     if (event.key === 'Enter') {
         connect();
     }
 });
+fitVideoToViewport();
