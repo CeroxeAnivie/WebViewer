@@ -1,38 +1,48 @@
-target/
-!.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
+# Build outputs
+/target/
+/out/
+/build/
 
-### IntelliJ IDEA ###
-.idea/modules.xml
-.idea/jarRepositories.xml
-.idea/compiler.xml
-.idea/libraries/
-*.iws
-*.iml
-*.ipr
+# Maven local wrapper/bootstrap noise
+/.mvn/wrapper/maven-wrapper.jar
 
-### Eclipse ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
+# Runtime logs and diagnostics
+*.log
+hs_err_pid*
+replay_pid*
 
-### NetBeans ###
-/nbproject/private/
-/nbbuild/
-/dist/
-/nbdist/
-/.nb-gradle/
-build/
-!**/src/main/**/build/
-!**/src/test/**/build/
-
-### VS Code ###
-.vscode/
-
-### Mac OS ###
+# OS files
 .DS_Store
+Thumbs.db
+Desktop.ini
+
+# IntelliJ IDEA: keep shared project metadata, ignore user-local state.
+/.idea/workspace.xml
+/.idea/shelf/
+/.idea/tasks.xml
+/.idea/usage.statistics.xml
+/.idea/dictionaries/
+/.idea/httpRequests/
+/.idea/dataSources/
+/.idea/dataSources.local.xml
+*.iws
+
+# Editor folders
+/.vscode/
+
+# Java package artifacts
+*.class
+*.jar
+*.war
+*.nar
+*.ear
+*.obj
+*.lib
+*.exp
+*.pdb
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
