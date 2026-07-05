@@ -8,12 +8,18 @@ const FLAG_INIT = 1;
 const FLAG_KEYFRAME = 2;
 const MAX_APPEND_QUEUE_BYTES = 10 * 1024 * 1024;
 const MAX_APPEND_QUEUE_SEGMENTS = 8;
-const START_BUFFER_SECONDS = 2.0;
-const STARTUP_MAX_WAIT_MS = 1800;
-const TARGET_LATENCY_SECONDS = 2.5;
-const MAX_LATENCY_SECONDS = 5.0;
-const PANIC_LATENCY_SECONDS = 7.0;
-const BACK_BUFFER_SECONDS = 8.0;
+const START_BUFFER_SECONDS = 8.0;
+const STARTUP_FALLBACK_BUFFER_SECONDS = 4.0;
+const STARTUP_MAX_WAIT_MS = 15000;
+const LOW_BUFFER_SECONDS = 2.0;
+const TARGET_LATENCY_SECONDS = 10.0;
+const MAX_LATENCY_SECONDS = 18.0;
+const PANIC_LATENCY_SECONDS = 35.0;
+const BACK_BUFFER_SECONDS = 60.0;
+const AUDIO_START_BUFFER_SECONDS = 1.2;
+const AUDIO_SCHEDULE_AHEAD_SECONDS = 2.5;
+const AUDIO_PLAYBACK_LEAD_SECONDS = 0.18;
+const AUDIO_MAX_BUFFER_SECONDS = 8.0;
 const RECONNECT_DELAY_MS = 800;
 
 const video = document.getElementById('screen');
@@ -39,6 +45,9 @@ let startupBufferStartedAt = 0;
 let lastFpsTime = performance.now();
 let audioContext = null;
 let audioNextTime = 0;
+let audioQueue = [];
+let audioQueueSeconds = 0;
+let audioSources = new Set();
 let resizeObserver = null;
 let reconnectTimer = 0;
 let userDisconnecting = false;
@@ -118,6 +127,7 @@ function resetPlayback() {
     waitingForStartupBuffer = true;
     startupBufferStartedAt = performance.now();
     frames = 0;
+    resetAudioScheduler();
     if (mediaSource && mediaSource.readyState === 'open') {
         try {
             mediaSource.endOfStream();
@@ -161,7 +171,7 @@ function ensureAudioContext() {
     }
     if (!audioContext) {
         audioContext = new AudioContextClass({ latencyHint: 'playback' });
-        audioNextTime = audioContext.currentTime + 0.15;
+        resetAudioScheduler();
     }
     if (audioContext.state === 'suspended') {
         audioContext.resume().catch(() => {});
@@ -176,11 +186,13 @@ function receiveAudioPacket(buffer, view) {
     const sampleRate = view.getUint32(8, false);
     const channels = view.getUint32(12, false);
     const payloadBytes = view.getUint32(20, false);
-    if (version !== 1 || channels < 1 || channels > 8 || AUDIO_HEADER_BYTES + payloadBytes > buffer.byteLength) {
+    if ((version !== 1 && version !== 2)
+            || channels < 1 || channels > 8
+            || AUDIO_HEADER_BYTES + payloadBytes > buffer.byteLength) {
         return;
     }
 
-    const samples = new Float32Array(buffer, AUDIO_HEADER_BYTES, payloadBytes / Float32Array.BYTES_PER_ELEMENT);
+    const samples = decodeAudioSamples(buffer, version, payloadBytes);
     const frameCount = Math.floor(samples.length / channels);
     if (frameCount <= 0) {
         return;
@@ -192,15 +204,74 @@ function receiveAudioPacket(buffer, view) {
             target[i] = samples[source];
         }
     }
+    enqueueAudioBuffer(audioBuffer);
+    pumpAudioQueue();
+}
+
+function decodeAudioSamples(buffer, version, payloadBytes) {
+    if (version === 1) {
+        return new Float32Array(buffer, AUDIO_HEADER_BYTES, payloadBytes / Float32Array.BYTES_PER_ELEMENT);
+    }
+    const view = new DataView(buffer, AUDIO_HEADER_BYTES, payloadBytes);
+    const samples = new Float32Array(payloadBytes / Int16Array.BYTES_PER_ELEMENT);
+    for (let i = 0, offset = 0; i < samples.length; i++, offset += 2) {
+        samples[i] = view.getInt16(offset, true) / 32768;
+    }
+    return samples;
+}
+
+function enqueueAudioBuffer(audioBuffer) {
+    audioQueue.push(audioBuffer);
+    audioQueueSeconds += audioBuffer.duration;
+    while (audioQueueSeconds > AUDIO_MAX_BUFFER_SECONDS && audioQueue.length > 1) {
+        const dropped = audioQueue.shift();
+        audioQueueSeconds -= dropped.duration;
+    }
+}
+
+function pumpAudioQueue() {
+    if (!audioContext || audioQueue.length === 0) {
+        return;
+    }
+    if (waitingForStartupBuffer || video.paused || video.readyState < 2) {
+        return;
+    }
+    const now = audioContext.currentTime;
+    if (audioNextTime <= now + 0.02) {
+        if (audioQueueSeconds < AUDIO_START_BUFFER_SECONDS) {
+            return;
+        }
+        audioNextTime = now + AUDIO_PLAYBACK_LEAD_SECONDS;
+    }
+    while (audioQueue.length > 0 && audioNextTime < now + AUDIO_SCHEDULE_AHEAD_SECONDS) {
+        const audioBuffer = audioQueue.shift();
+        audioQueueSeconds -= audioBuffer.duration;
+        scheduleAudioBuffer(audioBuffer);
+    }
+}
+
+function scheduleAudioBuffer(audioBuffer) {
     const source = audioContext.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(audioContext.destination);
-    const now = audioContext.currentTime;
-    if (audioNextTime < now + 0.05 || audioNextTime > now + 1.0) {
-        audioNextTime = now + 0.12;
-    }
+    audioSources.add(source);
+    source.onended = () => audioSources.delete(source);
     source.start(audioNextTime);
-    audioNextTime += frameCount / sampleRate;
+    audioNextTime += audioBuffer.duration;
+}
+
+function resetAudioScheduler() {
+    for (const source of audioSources) {
+        try {
+            source.stop();
+        } catch {
+            // A source can already be stopped by the browser audio clock.
+        }
+    }
+    audioSources.clear();
+    audioQueue = [];
+    audioQueueSeconds = 0;
+    audioNextTime = audioContext ? audioContext.currentTime + AUDIO_PLAYBACK_LEAD_SECONDS : 0;
 }
 
 function receiveVideoPacket(buffer, view) {
@@ -317,32 +388,40 @@ function trimBuffered() {
     if (waitingForStartupBuffer) {
         const bufferedInLatestRange = end - start;
         const waitedMs = performance.now() - startupBufferStartedAt;
-        if (bufferedInLatestRange < START_BUFFER_SECONDS && waitedMs < STARTUP_MAX_WAIT_MS) {
+        const enoughForSmoothStart = bufferedInLatestRange >= START_BUFFER_SECONDS
+                || (waitedMs >= STARTUP_MAX_WAIT_MS && bufferedInLatestRange >= STARTUP_FALLBACK_BUFFER_SECONDS);
+        if (!enoughForSmoothStart) {
             return;
         }
         seekToLiveRange(liveRange);
         waitingForStartupBuffer = false;
+        resetAudioScheduler();
         video.play().catch(() => {});
+        pumpAudioQueue();
         return;
     }
 
     if (!liveRange.containsCurrent || bufferedAhead > PANIC_LATENCY_SECONDS) {
         seekToLiveRange(liveRange);
+        resetAudioScheduler();
     } else if (bufferedAhead > MAX_LATENCY_SECONDS) {
         seekToLiveRange(liveRange);
+        resetAudioScheduler();
+    } else if (bufferedAhead > TARGET_LATENCY_SECONDS + 4.0) {
         video.playbackRate = 1.03;
-    } else if (bufferedAhead > TARGET_LATENCY_SECONDS + 1.0) {
-        video.playbackRate = 1.08;
-    } else if (bufferedAhead > TARGET_LATENCY_SECONDS + 0.35) {
-        video.playbackRate = 1.03;
-    } else if (bufferedAhead < TARGET_LATENCY_SECONDS - 1.0) {
-        video.playbackRate = 0.97;
+    } else if (bufferedAhead > TARGET_LATENCY_SECONDS + 2.0) {
+        video.playbackRate = 1.015;
+    } else if (bufferedAhead < LOW_BUFFER_SECONDS) {
+        video.playbackRate = 0.95;
+    } else if (bufferedAhead < TARGET_LATENCY_SECONDS - 3.0) {
+        video.playbackRate = 0.98;
     } else {
         video.playbackRate = 1.0;
     }
     if (video.paused) {
         video.play().catch(() => {});
     }
+    pumpAudioQueue();
     if (video.buffered.length > 1) {
         try {
             sourceBuffer.remove(video.buffered.start(0), start);
@@ -372,7 +451,11 @@ function updateStats(w, h, frameCount) {
         const liveBuffer = liveRange
                 ? displayBufferSeconds(liveRange).toFixed(1)
                 : '0.0';
-        setStatus(`${w}x${h} | ${frames} FPS | buffer ${liveBuffer}s | video/MSE`);
+        const playbackState = waitingForStartupBuffer
+                ? '\u542f\u52a8\u7f13\u51b2'
+                : '\u76f4\u64ad';
+        const audioBuffer = audioBufferedSeconds().toFixed(1);
+        setStatus(`${w}x${h} | ${frames} FPS | buffer ${liveBuffer}s | audio ${audioBuffer}s | ${playbackState} | video/MSE`);
         frames = 0;
         lastFpsTime = now;
     }
@@ -380,9 +463,21 @@ function updateStats(w, h, frameCount) {
 
 function displayBufferSeconds(liveRange) {
     if (liveRange.containsCurrent) {
-        return Math.max(0, liveRange.end - video.currentTime);
+        return playbackBufferSeconds(liveRange);
     }
     return Math.max(0, liveRange.end - liveRange.start);
+}
+
+function playbackBufferSeconds(liveRange) {
+    return Math.max(0, liveRange.end - video.currentTime);
+}
+
+function audioBufferedSeconds() {
+    const queued = Math.max(0, audioQueueSeconds);
+    if (!audioContext) {
+        return queued;
+    }
+    return queued + Math.max(0, audioNextTime - audioContext.currentTime);
 }
 
 function latestBufferedRange() {

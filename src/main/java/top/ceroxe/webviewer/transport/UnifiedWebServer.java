@@ -41,15 +41,17 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class UnifiedWebServer implements MediaChunkSink {
     private static final String RESOURCE_ROOT = "/static";
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    private static final int MAX_CLIENT_QUEUE = 24;
+    private static final int MAX_CLIENT_QUEUE = 2048;
+    private static final int MAX_QUEUED_AUDIO_FRAMES = 1500;
     private static final int MAX_CLIENT_CONTROL_PAYLOAD = 64 * 1024;
-    private static final int MAX_SOCKET_SEND_BUFFER_BYTES = 512 * 1024;
-    private static final int MIN_CLIENT_QUEUE_BYTES = 2 * 1024 * 1024;
-    private static final int MAX_CLIENT_QUEUE_BYTES = 16 * 1024 * 1024;
-    private static final double CLIENT_QUEUE_SECONDS = 2.0;
+    private static final int MAX_SOCKET_SEND_BUFFER_BYTES = 2 * 1024 * 1024;
+    private static final int MIN_CLIENT_QUEUE_BYTES = 4 * 1024 * 1024;
+    private static final int MAX_CLIENT_QUEUE_BYTES = 64 * 1024 * 1024;
+    private static final double CLIENT_QUEUE_SECONDS = 6.0;
     private static final long STATS_INTERVAL_NANOS = 5_000_000_000L;
-    private static final int MAX_FRAMES_PER_SOCKET_FLUSH = 12;
+    private static final int MAX_FRAMES_PER_SOCKET_FLUSH = 128;
     private static final int HEARTBEAT_SECONDS = 15;
+    private static final long AUDIO_PACKET_TARGET_MICROS = 100_000;
 
     private static final Map<String, String> MIME_TYPES = Map.of(
             "html", "text/html; charset=utf-8",
@@ -66,10 +68,16 @@ public final class UnifiedWebServer implements MediaChunkSink {
     private final AtomicLong lastStatsNanos = new AtomicLong(System.nanoTime());
     private final AtomicLong lastStatsPublished = new AtomicLong();
     private final CmafMuxer muxer = new CmafMuxer();
+    private final Object audioBatchLock = new Object();
+    private final ByteArrayOutputStream audioBatch = new ByteArrayOutputStream(64 * 1024);
     private final int maxClientQueuedBytes;
 
     private volatile byte[] latestInitSegment;
     private volatile byte[] latestKeySegment;
+    private int audioBatchSampleRate;
+    private int audioBatchChannels;
+    private long audioBatchTimestampMicros;
+    private long audioBatchFrames;
     private ServerSocket serverSocket;
     private Thread acceptThread;
 
@@ -110,7 +118,10 @@ public final class UnifiedWebServer implements MediaChunkSink {
 
     @Override
     public void publish(EncodedAudioChunk chunk) {
-        byte[] data = AudioWirePacket.packet(chunk);
+        byte[] data = audioPacketFromBatch(chunk);
+        if (data == null) {
+            return;
+        }
         for (Client client : clients) {
             long dropped = client.enqueueAudioPacket(data);
             if (dropped < 0) {
@@ -119,6 +130,46 @@ public final class UnifiedWebServer implements MediaChunkSink {
             } else if (dropped > 0) {
                 droppedFrames.addAndGet(dropped);
             }
+        }
+    }
+
+    private byte[] audioPacketFromBatch(EncodedAudioChunk chunk) {
+        int sampleRate = chunk.sampleRate();
+        int channels = chunk.channels();
+        byte[] payload = chunk.payload();
+        if (sampleRate <= 0 || channels <= 0 || payload.length == 0) {
+            return null;
+        }
+        int bytesPerFrame = channels * Float.BYTES;
+        if (payload.length % bytesPerFrame != 0) {
+            return null;
+        }
+        int frames = payload.length / bytesPerFrame;
+        if (frames <= 0) {
+            return null;
+        }
+
+        synchronized (audioBatchLock) {
+            if (audioBatchFrames == 0 || audioBatchSampleRate != sampleRate || audioBatchChannels != channels) {
+                audioBatch.reset();
+                audioBatchSampleRate = sampleRate;
+                audioBatchChannels = channels;
+                audioBatchTimestampMicros = chunk.timestampMicros();
+                audioBatchFrames = 0;
+            }
+            audioBatch.write(payload, 0, payload.length);
+            audioBatchFrames += frames;
+            long durationMicros = audioBatchFrames * 1_000_000L / audioBatchSampleRate;
+            if (durationMicros < AUDIO_PACKET_TARGET_MICROS) {
+                return null;
+            }
+
+            byte[] batchedPayload = audioBatch.toByteArray();
+            byte[] packet = AudioWirePacket.packet(batchedPayload, audioBatchSampleRate,
+                    audioBatchChannels, audioBatchTimestampMicros);
+            audioBatch.reset();
+            audioBatchFrames = 0;
+            return packet;
         }
     }
 
@@ -491,18 +542,19 @@ public final class UnifiedWebServer implements MediaChunkSink {
         }
 
         long enqueueVideoPacket(byte[] payload, boolean keyframe, boolean droppable) {
-            return enqueueFrame(0x2, payload, keyframe, droppable, true);
+            return enqueueFrame(0x2, payload, keyframe, droppable, true, false);
         }
 
         long enqueueAudioPacket(byte[] payload) {
-            return enqueueFrame(0x2, payload, false, true, false);
+            return enqueueFrame(0x2, payload, false, true, false, true);
         }
 
         long enqueueFrame(int opcode, byte[] payload, boolean keyframe) {
-            return enqueueFrame(opcode, payload, keyframe, false, false);
+            return enqueueFrame(opcode, payload, keyframe, false, false, false);
         }
 
-        long enqueueFrame(int opcode, byte[] payload, boolean keyframe, boolean droppable, boolean videoPacket) {
+        long enqueueFrame(int opcode, byte[] payload, boolean keyframe, boolean droppable,
+                          boolean videoPacket, boolean audioPacket) {
             if (!open.get() || closing.get()) {
                 return -1;
             }
@@ -511,17 +563,36 @@ public final class UnifiedWebServer implements MediaChunkSink {
                 return 1;
             }
             long dropped = 0;
+            boolean droppedVideo = false;
             if (videoPacket && keyframe) {
-                dropped = removeDroppableFrames();
                 waitingForKeyframe = false;
             }
-            OutboundFrame frame = new OutboundFrame(opcode, payload, droppable);
-            while ((queue.size() >= MAX_CLIENT_QUEUE || queuedBytes.get() + payload.length > maxQueuedBytes)
-                    && removeOneQueuedFrame()) {
-                dropped++;
+            OutboundFrame frame = new OutboundFrame(opcode, payload, droppable, videoPacket, audioPacket);
+            if (audioPacket) {
+                OutboundFrame removedAudio;
+                while ((countQueuedAudioFrames() >= MAX_QUEUED_AUDIO_FRAMES
+                        || queue.size() >= MAX_CLIENT_QUEUE
+                        || queuedBytes.get() + payload.length > maxQueuedBytes)
+                        && (removedAudio = removeOneQueuedAudioFrame()) != null) {
+                    dropped++;
+                }
+                if (countQueuedAudioFrames() >= MAX_QUEUED_AUDIO_FRAMES
+                        || queue.size() >= MAX_CLIENT_QUEUE
+                        || queuedBytes.get() + payload.length > maxQueuedBytes) {
+                    dropped++;
+                    droppedFrames.addAndGet(dropped);
+                    return dropped;
+                }
+            } else {
+                OutboundFrame removed;
+                while ((queue.size() >= MAX_CLIENT_QUEUE || queuedBytes.get() + payload.length > maxQueuedBytes)
+                        && (removed = removeOneQueuedFrameForVideo()) != null) {
+                    dropped++;
+                    droppedVideo |= removed.videoPacket();
+                }
             }
 
-            if (dropped > 0 && videoPacket && !keyframe) {
+            if (droppedVideo && videoPacket && !keyframe) {
                 waitingForKeyframe = true;
                 dropped++;
                 droppedFrames.addAndGet(dropped);
@@ -535,7 +606,8 @@ public final class UnifiedWebServer implements MediaChunkSink {
                     droppedFrames.addAndGet(dropped);
                     return dropped;
                 }
-                dropped += removeDroppableFrames();
+                DropStats stats = removeDroppableFrames();
+                dropped += stats.count();
             }
             if (!queue.offerLast(frame)) {
                 if (droppable) {
@@ -557,25 +629,51 @@ public final class UnifiedWebServer implements MediaChunkSink {
             queuedBytes.updateAndGet(current -> current <= length ? 0 : current - length);
         }
 
-        private long removeDroppableFrames() {
+        private DropStats removeDroppableFrames() {
             long dropped = 0;
+            boolean droppedVideo = false;
             for (OutboundFrame frame : queue) {
                 if (frame.droppable() && queue.remove(frame)) {
                     subtractQueuedBytes(frame.payload().length);
                     dropped++;
+                    droppedVideo |= frame.videoPacket();
                 }
             }
-            return dropped;
+            return new DropStats(dropped, droppedVideo);
         }
 
-        private boolean removeOneQueuedFrame() {
+        private OutboundFrame removeOneQueuedAudioFrame() {
+            for (OutboundFrame frame : queue) {
+                if (frame.audioPacket() && queue.remove(frame)) {
+                    subtractQueuedBytes(frame.payload().length);
+                    return frame;
+                }
+            }
+            return null;
+        }
+
+        private OutboundFrame removeOneQueuedFrameForVideo() {
+            OutboundFrame audio = removeOneQueuedAudioFrame();
+            if (audio != null) {
+                return audio;
+            }
             for (OutboundFrame frame : queue) {
                 if (frame.droppable() && queue.remove(frame)) {
                     subtractQueuedBytes(frame.payload().length);
-                    return true;
+                    return frame;
                 }
             }
-            return false;
+            return null;
+        }
+
+        private int countQueuedAudioFrames() {
+            int count = 0;
+            for (OutboundFrame frame : queue) {
+                if (frame.audioPacket()) {
+                    count++;
+                }
+            }
+            return count;
         }
 
         int queueSize() {
@@ -680,7 +778,7 @@ public final class UnifiedWebServer implements MediaChunkSink {
             }
             queue.clear();
             queuedBytes.set(0);
-            OutboundFrame closeFrame = new OutboundFrame(0x8, closePayload, false);
+            OutboundFrame closeFrame = new OutboundFrame(0x8, closePayload, false, false, false);
             queue.offerLast(closeFrame);
             queuedBytes.addAndGet(closePayload.length);
             open.set(false);
@@ -695,7 +793,11 @@ public final class UnifiedWebServer implements MediaChunkSink {
         }
     }
 
-    private record OutboundFrame(int opcode, byte[] payload, boolean droppable) {
+    private record OutboundFrame(int opcode, byte[] payload, boolean droppable, boolean videoPacket,
+                                 boolean audioPacket) {
+    }
+
+    private record DropStats(long count, boolean droppedVideo) {
     }
 
     private static final class CmafWirePacket {
@@ -730,20 +832,44 @@ public final class UnifiedWebServer implements MediaChunkSink {
 
     private static final class AudioWirePacket {
         private static final int MAGIC = 0x50434d41;
-        private static final int VERSION = 1;
+        private static final int VERSION = 2;
         private static final int HEADER_BYTES = 24;
 
         static byte[] packet(EncodedAudioChunk chunk) {
-            byte[] payload = chunk.payload();
-            byte[] out = new byte[HEADER_BYTES + payload.length];
+            return packet(chunk.payload(), chunk.sampleRate(), chunk.channels(), chunk.timestampMicros());
+        }
+
+        static byte[] packet(byte[] payload, int sampleRate, int channels, long timestampMicros) {
+            byte[] encodedPayload = encodePcm16(payload);
+            byte[] out = new byte[HEADER_BYTES + encodedPayload.length];
             putU32(out, 0, MAGIC);
             putU32(out, 4, VERSION);
-            putU32(out, 8, chunk.sampleRate());
-            putU32(out, 12, chunk.channels());
-            putU32(out, 16, (int) chunk.timestampMicros());
-            putU32(out, 20, payload.length);
-            System.arraycopy(payload, 0, out, HEADER_BYTES, payload.length);
+            putU32(out, 8, sampleRate);
+            putU32(out, 12, channels);
+            putU32(out, 16, (int) timestampMicros);
+            putU32(out, 20, encodedPayload.length);
+            System.arraycopy(encodedPayload, 0, out, HEADER_BYTES, encodedPayload.length);
             return out;
+        }
+
+        private static byte[] encodePcm16(byte[] float32Payload) {
+            int sampleCount = float32Payload.length / Float.BYTES;
+            byte[] pcm16 = new byte[sampleCount * Short.BYTES];
+            for (int sample = 0, in = 0, out = 0; sample < sampleCount; sample++, in += 4, out += 2) {
+                int bits = (float32Payload[in] & 0xff)
+                        | ((float32Payload[in + 1] & 0xff) << 8)
+                        | ((float32Payload[in + 2] & 0xff) << 16)
+                        | ((float32Payload[in + 3] & 0xff) << 24);
+                float value = Float.intBitsToFloat(bits);
+                if (!Float.isFinite(value)) {
+                    value = 0.0f;
+                }
+                float clamped = Math.max(-1.0f, Math.min(1.0f, value));
+                short pcm = (short) Math.round(clamped * 32767.0f);
+                pcm16[out] = (byte) pcm;
+                pcm16[out + 1] = (byte) (pcm >>> 8);
+            }
+            return pcm16;
         }
 
         private static void putU32(byte[] out, int offset, int value) {

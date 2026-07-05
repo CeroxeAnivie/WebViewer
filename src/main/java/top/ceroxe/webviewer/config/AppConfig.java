@@ -21,7 +21,7 @@ public record AppConfig(
     private static final int BITRATE_STEP = 1_000_000;
     private static final int FULL_BITRATE_FPS = 60;
     private static final double HIGH_FPS_EXTRA_WEIGHT = 0.35;
-    private static final double LIVE_BITS_PER_PIXEL_FRAME = 0.038;
+    private static final double LIVE_BITS_PER_PIXEL_FRAME = 0.030;
 
     public AppConfig {
         requirePort(httpPort, "httpPort");
